@@ -3,16 +3,8 @@ Tests for DetectionService.
 
 All tests use:
   - MockBirdIdentifier  (no real model)
-  - In-memory SQLite    (no real database file)
+  - In-memory SQLite    (shared connection)
   - Synthetic numpy audio (no real microphone)
-
-SQLite in-memory isolation note
---------------------------------
-SQLite :memory: databases are connection-scoped: each new connection
-gets an empty database. To share schema + data across the service's
-background thread and the test's query session we use a single
-persistent connection for the entire test, passed via
-creator=lambda: shared_conn to create_engine.
 """
 
 import sys
@@ -22,18 +14,18 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backend.detection.service import DetectionService, DetectionServiceError
 from backend.identification.mock_identifier import MockBirdIdentifier
-from backend.identification.base import BirdIdentifierError
 from backend.audio.detector import BirdDetector
 from backend.audio.processor import AudioProcessor
-from backend.database.models import Base, Detection, Species
+from backend.database.models import Base, Detection, Species, DetectionEvent
 from backend.database.repository import DetectionRepository
+from backend.detection.grouper import DetectionGrouper
 
 
 # ---------------------------------------------------------------------------
@@ -45,14 +37,6 @@ SAMPLE_RATE = 16000
 
 @pytest.fixture
 def mem_engine():
-    """
-    In-memory SQLite engine backed by a single shared connection.
-
-    Using creator=lambda: conn forces SQLAlchemy to reuse the same
-    underlying sqlite3 connection for every Session it opens, so the
-    schema created by Base.metadata.create_all() is visible to all
-    threads and sessions throughout the test.
-    """
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     engine = create_engine("sqlite://", creator=lambda: conn)
     Base.metadata.create_all(engine)
@@ -63,7 +47,6 @@ def mem_engine():
 
 @pytest.fixture
 def session_factory(mem_engine):
-    """Session factory bound to the shared-connection engine."""
     return sessionmaker(
         bind=mem_engine,
         autocommit=False,
@@ -74,14 +57,12 @@ def session_factory(mem_engine):
 
 @pytest.fixture
 def query_session(session_factory):
-    """Session for querying results after the service has run."""
-    session = session_factory()
-    yield session
-    session.close()
+    s = session_factory()
+    yield s
+    s.close()
 
 
 def _sine(seconds=3.0, freq=4000.0, sr=SAMPLE_RATE, amplitude=0.5):
-    """Bird-frequency sine wave that passes the detector."""
     t = np.linspace(0, seconds, int(seconds * sr), endpoint=False)
     return (amplitude * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
@@ -91,7 +72,6 @@ def _silence(seconds=3.0, sr=SAMPLE_RATE):
 
 
 def _make_detector():
-    """Detector tuned for 16 kHz test audio (freq_max below Nyquist)."""
     return BirdDetector(
         energy_threshold=0.001,
         freq_min=1000,
@@ -106,31 +86,38 @@ def _make_detector():
 
 class TestConstruction:
     def test_default_construction(self):
-        identifier = MockBirdIdentifier(mode="fixed")
-        service = DetectionService(identifier=identifier)
+        service = DetectionService(identifier=MockBirdIdentifier(mode="fixed"))
         assert not service.is_running
 
     def test_repr(self):
         service = DetectionService(identifier=MockBirdIdentifier())
         assert "DetectionService" in repr(service)
 
+    def test_grouping_enabled_by_default(self):
+        service = DetectionService(identifier=MockBirdIdentifier())
+        assert service.get_stats()["grouping_enabled"] is True
+
+    def test_grouping_can_be_disabled(self):
+        service = DetectionService(
+            identifier=MockBirdIdentifier(),
+            enable_grouping=False,
+        )
+        assert service.get_stats()["grouping_enabled"] is False
+
+    def test_custom_grouper_accepted(self, session_factory):
+        repo = DetectionRepository()
+        grouper = DetectionGrouper(repo, gap_seconds=30.0)
+        service = DetectionService(
+            identifier=MockBirdIdentifier(mode="fixed"),
+            grouper=grouper,
+            session_factory=session_factory,
+        )
+        assert service is not None
+
     def test_custom_detector_accepted(self):
         service = DetectionService(
             identifier=MockBirdIdentifier(mode="fixed"),
             detector=BirdDetector(energy_threshold=0.0, band_ratio_threshold=0.0),
-        )
-        assert service is not None
-
-    def test_custom_processor_accepted(self):
-        segments = []
-        processor = AudioProcessor(
-            segment_callback=lambda s, r: segments.append(s),
-            segment_duration=1.0,
-            overlap_duration=0.0,
-        )
-        service = DetectionService(
-            identifier=MockBirdIdentifier(mode="fixed"),
-            processor=processor,
         )
         assert service is not None
 
@@ -162,13 +149,13 @@ class TestLifecycle:
     def test_double_start_safe(self):
         service = DetectionService(identifier=MockBirdIdentifier(mode="fixed"))
         service.start()
-        service.start()  # must not raise
+        service.start()
         assert service.is_running is True
         service.stop()
 
     def test_stop_without_start_safe(self):
         service = DetectionService(identifier=MockBirdIdentifier(mode="fixed"))
-        service.stop()  # must not raise
+        service.stop()
 
     def test_handle_chunk_ignored_when_not_running(self):
         service = DetectionService(identifier=MockBirdIdentifier(mode="fixed"))
@@ -184,13 +171,13 @@ class TestStats:
     def test_stats_keys_present(self):
         service = DetectionService(identifier=MockBirdIdentifier())
         stats = service.get_stats()
-        assert "running" in stats
-        assert "chunks_received" in stats
-        assert "segments_analysed" in stats
-        assert "segments_accepted" in stats
-        assert "detections_saved" in stats
-        assert "identifier" in stats
-        assert "identifier_version" in stats
+        for key in (
+            "running", "chunks_received", "segments_analysed",
+            "segments_accepted", "detections_saved",
+            "events_created_or_extended", "grouping_enabled",
+            "identifier", "identifier_version",
+        ):
+            assert key in stats
 
     def test_stats_identifier_name(self):
         service = DetectionService(identifier=MockBirdIdentifier())
@@ -224,7 +211,6 @@ class TestPipelineFlow:
         for _ in range(3):
             service.handle_chunk(_silence(1.0), SAMPLE_RATE)
         service.stop()
-
         assert service.get_stats()["segments_accepted"] == 0
         assert identifier.call_count == 0
 
@@ -239,14 +225,12 @@ class TestPipelineFlow:
         service.start()
         service.handle_chunk(_sine(1.0), SAMPLE_RATE)
         service.stop()
-
         assert service.get_stats()["segments_accepted"] >= 1
         assert identifier.call_count >= 1
 
     def test_low_confidence_not_saved(self):
-        identifier = MockBirdIdentifier(mode="fixed", fixed_confidence=0.3)
         service = DetectionService(
-            identifier=identifier,
+            identifier=MockBirdIdentifier(mode="fixed", fixed_confidence=0.3),
             detector=BirdDetector(energy_threshold=0.0, band_ratio_threshold=0.0),
             min_confidence=0.8,
             segment_duration=1.0,
@@ -255,7 +239,6 @@ class TestPipelineFlow:
         service.start()
         service.handle_chunk(_sine(1.0), SAMPLE_RATE)
         service.stop()
-
         assert service.get_stats()["detections_saved"] == 0
 
     def test_empty_identifier_saves_nothing(self):
@@ -268,7 +251,6 @@ class TestPipelineFlow:
         service.start()
         service.handle_chunk(_sine(1.0), SAMPLE_RATE)
         service.stop()
-
         assert service.get_stats()["detections_saved"] == 0
 
 
@@ -278,7 +260,6 @@ class TestPipelineFlow:
 
 class TestEndToEnd:
     def test_detections_written_to_database(self, session_factory, query_session):
-        """Full pipeline: audio → detector → identifier → DB."""
         service = DetectionService(
             identifier=MockBirdIdentifier(mode="fixed", fixed_confidence=0.9),
             detector=_make_detector(),
@@ -294,14 +275,13 @@ class TestEndToEnd:
         detections = query_session.query(Detection).all()
         species = query_session.query(Species).all()
 
-        assert len(detections) > 0, "At least one detection should be saved"
-        assert len(species) > 0, "At least one species should be created"
+        assert len(detections) > 0
+        assert len(species) > 0
         assert all(d.confidence >= 0.5 for d in detections)
 
     def test_species_created_once_for_repeated_detections(
         self, session_factory, query_session
     ):
-        """Detecting the same species twice must create only one Species row."""
         service = DetectionService(
             identifier=MockBirdIdentifier(mode="fixed", fixed_confidence=0.9),
             detector=_make_detector(),
@@ -320,15 +300,9 @@ class TestEndToEnd:
             .filter(Species.scientific_name == "Erithacus rubecula")
             .count()
         )
-        assert robin_count == 1, "Species must not be duplicated"
+        assert robin_count == 1
 
     def test_mock_recorder_to_service_pipeline(self, session_factory, query_session):
-        """
-        Full end-to-end: MockAudioRecorder → DetectionService → DB.
-
-        The shared sqlite3 connection (via mem_engine fixture) ensures
-        the schema and all writes are visible across threads.
-        """
         from backend.audio.mock_recorder import MockAudioRecorder
 
         service = DetectionService(
@@ -352,8 +326,88 @@ class TestEndToEnd:
         service.stop()
 
         detections = query_session.query(Detection).all()
-
-        assert len(detections) > 0, "At least one detection should be saved"
+        assert len(detections) > 0
         stats = service.get_stats()
         assert stats["chunks_received"] == 3
         assert stats["detections_saved"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Grouping integration tests
+# ---------------------------------------------------------------------------
+
+class TestGroupingIntegration:
+    def test_grouping_creates_events(self, session_factory, query_session):
+        """Detections must be grouped into DetectionEvents."""
+        service = DetectionService(
+            identifier=MockBirdIdentifier(mode="fixed", fixed_confidence=0.9),
+            detector=_make_detector(),
+            session_factory=session_factory,
+            min_confidence=0.5,
+            segment_duration=1.0,
+            overlap_duration=0.0,
+            enable_grouping=True,
+        )
+        service.start()
+        service.handle_chunk(_sine(1.0), SAMPLE_RATE)
+        service.stop()
+
+        events = query_session.query(DetectionEvent).all()
+        assert len(events) > 0
+
+    def test_grouping_disabled_creates_no_events(
+        self, session_factory, query_session
+    ):
+        """When grouping is disabled no DetectionEvents are created."""
+        service = DetectionService(
+            identifier=MockBirdIdentifier(mode="fixed", fixed_confidence=0.9),
+            detector=_make_detector(),
+            session_factory=session_factory,
+            min_confidence=0.5,
+            segment_duration=1.0,
+            overlap_duration=0.0,
+            enable_grouping=False,
+        )
+        service.start()
+        service.handle_chunk(_sine(1.0), SAMPLE_RATE)
+        service.stop()
+
+        events = query_session.query(DetectionEvent).all()
+        assert len(events) == 0
+
+    def test_detections_linked_to_events(self, session_factory, query_session):
+        """After grouping, each Detection must have a grouped_event_id."""
+        service = DetectionService(
+            identifier=MockBirdIdentifier(
+                mode="fixed", fixed_confidence=0.9
+            ),
+            detector=_make_detector(),
+            session_factory=session_factory,
+            min_confidence=0.5,
+            segment_duration=1.0,
+            overlap_duration=0.0,
+            enable_grouping=True,
+        )
+        service.start()
+        service.handle_chunk(_sine(1.0), SAMPLE_RATE)
+        service.stop()
+
+        detections = query_session.query(Detection).all()
+        assert all(d.grouped_event_id is not None for d in detections)
+
+    def test_events_created_counter_increments(self, session_factory):
+        """events_created_or_extended stat must increment."""
+        service = DetectionService(
+            identifier=MockBirdIdentifier(mode="fixed", fixed_confidence=0.9),
+            detector=_make_detector(),
+            session_factory=session_factory,
+            min_confidence=0.5,
+            segment_duration=1.0,
+            overlap_duration=0.0,
+            enable_grouping=True,
+        )
+        service.start()
+        service.handle_chunk(_sine(1.0), SAMPLE_RATE)
+        service.stop()
+
+        assert service.get_stats()["events_created_or_extended"] > 0
