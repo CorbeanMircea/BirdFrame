@@ -1,37 +1,18 @@
 """
-CollageGenerator — composes a "Heard Recently" image from bird artwork.
+CollageGenerator — composes a "Heard Recently" scattered collage.
 
-Takes a list of species (with artwork paths) and arranges them into a
-single image suitable for display on a screen or frame.
+Layout: bird illustrations are placed freely across the canvas at
+varying sizes and slight rotations. The placement algorithm actively
+avoids overlap by trying many candidate positions and picking the
+one with the least overlap.
 
-Layout: a clean grid of bird illustrations, each with the species name
-below it. Background is off-white parchment to complement the vintage
-natural history aesthetic.
-
-The generator is stateless — call generate() as many times as needed.
 Output is a JPEG saved to config.COLLAGE_DIR.
-
-Usage:
-
-    from backend.collage.generator import CollageGenerator
-    from backend.artwork.static_provider import StaticArtworkProvider
-    from backend.database.repository import DetectionRepository
-
-    generator = CollageGenerator()
-    provider = StaticArtworkProvider()
-
-    species_paths = {
-        "Erithacus rubecula": ("European Robin", provider.get_artwork("Erithacus rubecula")),
-        "Parus major": ("Great Tit", provider.get_artwork("Parus major")),
-    }
-
-    output_path = generator.generate(species_paths)
-    print(f"Collage saved to: {output_path}")
 """
 
 import sys
 import logging
 import math
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -42,41 +23,44 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Parchment/paper colour — warm off-white to complement vintage illustrations
+# Parchment background
 BACKGROUND_COLOUR = (245, 240, 228)
 
 # Text colours
-TITLE_COLOUR = (60, 45, 30)       # dark brown
-SPECIES_COLOUR = (80, 60, 40)     # medium brown
-SUBTITLE_COLOUR = (120, 100, 80)  # muted brown
+TITLE_COLOUR   = (60, 45, 30)
+SUBTITLE_COLOUR = (130, 110, 85)
 
-# Padding and spacing
-CELL_PADDING = 30          # pixels inside each grid cell
-LABEL_HEIGHT = 60          # reserved for species name below each image
-TITLE_AREA_HEIGHT = 100    # reserved for the "Heard Recently" title
+# Layout parameters
+MIN_BIRD_SCALE    = 0.12   # smallest bird as fraction of canvas width
+MAX_BIRD_SCALE    = 0.20   # largest bird as fraction of canvas width
+MAX_ROTATION      = 18     # degrees either side
+PLACEMENT_TRIES   = 200    # candidate positions tried per bird
+MARGIN            = 20     # minimum pixels from canvas edge
+FOOTER_HEIGHT     = 70     # reserved at the bottom for title bar
+# Minimum clearance between birds (pixels). Set to 0 to allow touching.
+MIN_GAP           = 15
 
 
 class CollageGeneratorError(Exception):
-    """Raised when the CollageGenerator cannot produce an image."""
     pass
 
 
 class CollageGenerator:
     """
-    Composes a "Heard Recently" collage image from bird artwork.
+    Composes a scattered "Heard Recently" collage image.
 
     Parameters
     ----------
-    width : int
-        Output image width in pixels. Defaults to config.COLLAGE_WIDTH.
-    height : int
-        Output image height in pixels. Defaults to config.COLLAGE_HEIGHT.
+    width, height : int
+        Output dimensions in pixels.
     output_dir : Path | None
-        Directory to save generated collages. Defaults to config.COLLAGE_DIR.
+        Where to save generated images.
     max_species : int
-        Maximum number of species to include. Defaults to config.COLLAGE_MAX_SPECIES.
+        Cap on species shown.
     title : str
-        Text shown at the top of the collage.
+        Footer title text.
+    seed : int | None
+        Fix the random seed for a reproducible layout.
     """
 
     def __init__(
@@ -86,18 +70,15 @@ class CollageGenerator:
         output_dir: Optional[Path] = None,
         max_species: int = config.COLLAGE_MAX_SPECIES,
         title: str = "Heard Recently",
+        seed: Optional[int] = None,
     ) -> None:
         self._width = width
         self._height = height
         self._output_dir = output_dir or config.COLLAGE_DIR
         self._max_species = max_species
         self._title = title
-
+        self._seed = seed
         self._output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
 
     @property
     def width(self) -> int:
@@ -107,219 +88,249 @@ class CollageGenerator:
     def height(self) -> int:
         return self._height
 
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
     def generate(
         self,
         species_paths: dict[str, tuple[str, Optional[Path]]],
         filename: Optional[str] = None,
     ) -> Path:
         """
-        Generate a collage image and save it to output_dir.
+        Generate a scattered collage and save it to output_dir.
 
         Parameters
         ----------
         species_paths : dict[str, tuple[str, Optional[Path]]]
-            Mapping of scientific_name → (common_name, artwork_path).
-            artwork_path may be None — those species are skipped.
+            scientific_name → (common_name, artwork_path | None)
         filename : str | None
             Output filename. Defaults to collage_<timestamp>.jpg.
-
-        Returns
-        -------
-        Path
-            Absolute path to the saved collage image.
-
-        Raises
-        ------
-        CollageGeneratorError
-            If Pillow is not installed or no valid artwork is available.
         """
         try:
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image, ImageDraw, ImageFont, ImageFilter
         except ImportError as exc:
             raise CollageGeneratorError(
                 "Pillow is not installed. Run: pip install pillow"
             ) from exc
 
-        # Filter to species that have artwork
         valid = {
             sci: (common, path)
             for sci, (common, path) in species_paths.items()
-            if path is not None and path.exists()
+            if path is not None and Path(path).exists()
         }
-
         if not valid:
             raise CollageGeneratorError(
-                "No valid artwork paths provided — cannot generate collage."
+                "No valid artwork paths — cannot generate collage."
             )
-
-        # Limit to max_species
         if len(valid) > self._max_species:
             valid = dict(list(valid.items())[: self._max_species])
 
-        logger.info(
-            "Generating collage: %d species, %dx%d px",
-            len(valid), self._width, self._height,
-        )
+        rng = random.Random(self._seed)
 
-        # Build the image
-        img = self._build_image(valid, Image, ImageDraw, ImageFont)
+        canvas = Image.new("RGB", (self._width, self._height), BACKGROUND_COLOUR)
+        canvas = self._add_paper_texture(canvas, rng, Image)
 
-        # Save
+        self._scatter_birds(canvas, valid, rng, Image)
+        self._draw_footer(canvas, ImageDraw, ImageFont)
+        self._draw_border(canvas, ImageDraw)
+
         if filename is None:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             filename = f"collage_{ts}.jpg"
 
         output_path = self._output_dir / filename
-        img.save(str(output_path), "JPEG", quality=92)
-        logger.info("Collage saved: %s", output_path)
-
+        canvas.save(str(output_path), "JPEG", quality=93)
+        logger.info("Collage saved: %s (%d species)", output_path, len(valid))
         return output_path
 
     def generate_latest(
         self,
         species_paths: dict[str, tuple[str, Optional[Path]]],
     ) -> Path:
-        """
-        Generate a collage and save it as 'latest.jpg', overwriting any
-        previous version. Useful for the API endpoint that always serves
-        the most recent collage.
-        """
+        """Generate and save as latest.jpg, overwriting any previous version."""
         return self.generate(species_paths, filename="latest.jpg")
 
     # ------------------------------------------------------------------
-    # Internal image construction
+    # Paper texture
     # ------------------------------------------------------------------
 
-    def _build_image(self, valid, Image, ImageDraw, ImageFont):
-        """Compose the full collage image and return a PIL Image."""
-        img = Image.new("RGB", (self._width, self._height), BACKGROUND_COLOUR)
-        draw = ImageDraw.Draw(img)
+    def _add_paper_texture(self, canvas, rng, Image):
+        """Subtle noise grain to simulate aged paper."""
+        try:
+            import numpy as np
+            w, h = canvas.size
+            np.random.seed(rng.randint(0, 0xFFFF))
+            grain = np.random.randint(-10, 11, (h, w, 3), dtype=np.int16)
+            arr = np.clip(np.array(canvas, dtype=np.int16) + grain, 0, 255)
+            return Image.fromarray(arr.astype(np.uint8))
+        except ImportError:
+            return canvas
 
-        # Draw title
-        self._draw_title(draw, ImageFont)
+    # ------------------------------------------------------------------
+    # Bird scattering — overlap-aware placement
+    # ------------------------------------------------------------------
 
-        # Compute grid layout
-        n = len(valid)
-        cols, rows = self._grid_dimensions(n)
-        cell_w = self._width // cols
-        cell_h = (self._height - TITLE_AREA_HEIGHT) // rows
+    def _scatter_birds(self, canvas, valid, rng, Image) -> None:
+        """
+        Place bird illustrations across the canvas.
 
-        # Draw each species cell
-        for idx, (sci, (common, path)) in enumerate(valid.items()):
-            row = idx // cols
-            col = idx % cols
-            x = col * cell_w
-            y = TITLE_AREA_HEIGHT + row * cell_h
-            self._draw_cell(img, draw, ImageFont, x, y, cell_w, cell_h,
-                            sci, common, path, Image)
+        For each bird we try PLACEMENT_TRIES random positions and pick
+        the one with zero overlap if possible, or minimum overlap if not.
+        Birds are sorted largest-first so big birds are placed first,
+        making it easier to slot smaller ones around them.
+        """
+        items = list(valid.items())
+        rng.shuffle(items)
 
-        # Draw subtle border
+        n = len(items)
+        scales = self._pick_scales(n, rng)
+
+        # Pre-load and resize all images so we know their sizes before placing
+        prepared: list[tuple[str, str, object, float]] = []
+        for (sci, (common, path)), scale in zip(items, scales):
+            try:
+                bird = Image.open(str(path)).convert("RGBA")
+            except Exception as exc:
+                logger.warning("Cannot open %s: %s", path, exc)
+                continue
+
+            target_w = int(self._width * scale)
+            bird = _fit_to_width(bird, target_w)
+
+            angle = rng.uniform(-MAX_ROTATION, MAX_ROTATION)
+            if rng.random() < 0.45:
+                bird = bird.transpose(Image.FLIP_LEFT_RIGHT)
+            bird = bird.rotate(angle, expand=True, resample=Image.BICUBIC)
+
+            prepared.append((sci, common, bird, scale))
+
+        # Sort largest first (by area) so big birds are placed first
+        prepared.sort(key=lambda t: t[2].size[0] * t[2].size[1], reverse=True)
+
+        # Canvas area available for placement (excluding footer)
+        available_h = self._height - FOOTER_HEIGHT - MARGIN
+
+        # Placed bounding boxes with a gap buffer
+        placed: list[tuple[int, int, int, int]] = []
+
+        for sci, common, bird_img, scale in prepared:
+            bw, bh = bird_img.size
+
+            x, y = self._best_placement(bw, bh, placed, available_h, rng)
+
+            # Paste with alpha mask
+            mask = self._make_mask(bird_img, Image)
+            canvas.paste(bird_img.convert("RGB"), (x, y), mask)
+
+            # Record placed bbox (with gap buffer for next placements)
+            placed.append((
+                x - MIN_GAP,
+                y - MIN_GAP,
+                x + bw + MIN_GAP,
+                y + bh + MIN_GAP,
+            ))
+
+    def _best_placement(
+        self,
+        bw: int,
+        bh: int,
+        placed: list[tuple[int, int, int, int]],
+        available_h: int,
+        rng: random.Random,
+    ) -> tuple[int, int]:
+        """
+        Try PLACEMENT_TRIES random positions and return the best one.
+
+        'Best' = zero overlap if achievable, otherwise minimum total
+        overlap area. We sample positions from a grid-jittered
+        distribution so candidates cover the canvas more evenly.
+        """
+        max_x = max(MARGIN, self._width - bw - MARGIN)
+        max_y = max(MARGIN, available_h - bh - MARGIN)
+
+        # Generate candidate positions using grid jitter for even coverage
+        candidates = _generate_candidates(
+            max_x, max_y, PLACEMENT_TRIES, rng
+        )
+
+        best_pos = (rng.randint(MARGIN, max(MARGIN + 1, max_x)),
+                    rng.randint(MARGIN, max(MARGIN + 1, max_y)))
+        best_overlap = float("inf")
+
+        for cx, cy in candidates:
+            # Clamp to valid range
+            cx = max(MARGIN, min(cx, max_x))
+            cy = max(MARGIN, min(cy, max_y))
+
+            ov = _total_overlap(cx, cy, bw, bh, placed)
+            if ov < best_overlap:
+                best_overlap = ov
+                best_pos = (cx, cy)
+            if ov == 0:
+                break  # perfect placement found — stop early
+
+        return best_pos
+
+    def _pick_scales(self, n: int, rng: random.Random) -> list[float]:
+        """Mix of larger feature birds and smaller background birds."""
+        scales = []
+        for i in range(n):
+            if i == 0:
+                # One prominent feature bird
+                s = rng.uniform(MAX_BIRD_SCALE * 0.9, MAX_BIRD_SCALE)
+            elif i < max(2, n // 3):
+                s = rng.uniform(MAX_BIRD_SCALE * 0.65, MAX_BIRD_SCALE * 0.85)
+            else:
+                s = rng.uniform(MIN_BIRD_SCALE, MAX_BIRD_SCALE * 0.65)
+            scales.append(s)
+        rng.shuffle(scales)
+        return scales
+
+    @staticmethod
+    def _make_mask(img, Image):
+        if img.mode == "RGBA":
+            return img.split()[3]
+        return Image.new("L", img.size, 255)
+
+    # ------------------------------------------------------------------
+    # Footer and border
+    # ------------------------------------------------------------------
+
+    def _draw_footer(self, canvas, ImageDraw, ImageFont) -> None:
+        draw = ImageDraw.Draw(canvas)
+        w, h = canvas.size
+        footer_y = h - FOOTER_HEIGHT
+
+        draw.rectangle([0, footer_y, w, h], fill=(235, 228, 210))
+        draw.line([(0, footer_y), (w, footer_y)], fill=(180, 160, 130), width=2)
+
+        title_font = self._get_font(ImageFont, size=32, bold=True)
+        sub_font = self._get_font(ImageFont, size=18)
+
+        draw.text((30, footer_y + 10), self._title,
+                  fill=TITLE_COLOUR, font=title_font)
+
+        now_str = datetime.now(timezone.utc).strftime("%d %B %Y  %H:%M UTC")
+        sub_bbox = draw.textbbox((0, 0), now_str, font=sub_font)
+        sub_w = sub_bbox[2] - sub_bbox[0]
+        draw.text((w - sub_w - 30, footer_y + 22), now_str,
+                  fill=SUBTITLE_COLOUR, font=sub_font)
+
+    def _draw_border(self, canvas, ImageDraw) -> None:
+        draw = ImageDraw.Draw(canvas)
         draw.rectangle(
-            [2, 2, self._width - 3, self._height - 3],
+            [3, 3, self._width - 4, self._height - 4],
             outline=(180, 160, 130),
             width=3,
         )
 
-        return img
-
-    def _draw_title(self, draw, ImageFont) -> None:
-        """Draw the title text at the top of the image."""
-        font = self._get_font(ImageFont, size=52, bold=True)
-        subtitle_font = self._get_font(ImageFont, size=22)
-
-        # Main title
-        title_bbox = draw.textbbox((0, 0), self._title, font=font)
-        title_w = title_bbox[2] - title_bbox[0]
-        title_x = (self._width - title_w) // 2
-        draw.text((title_x, 18), self._title, fill=TITLE_COLOUR, font=font)
-
-        # Subtitle with timestamp
-        now_str = datetime.now(timezone.utc).strftime("%d %B %Y, %H:%M UTC")
-        sub_bbox = draw.textbbox((0, 0), now_str, font=subtitle_font)
-        sub_w = sub_bbox[2] - sub_bbox[0]
-        sub_x = (self._width - sub_w) // 2
-        draw.text((sub_x, 72), now_str, fill=SUBTITLE_COLOUR, font=subtitle_font)
-
-        # Separator line
-        draw.line(
-            [(40, TITLE_AREA_HEIGHT - 8), (self._width - 40, TITLE_AREA_HEIGHT - 8)],
-            fill=(180, 160, 130),
-            width=2,
-        )
-
-    def _draw_cell(
-        self, img, draw, ImageFont,
-        x, y, cell_w, cell_h,
-        sci, common, path, Image,
-    ) -> None:
-        """Draw one species: artwork + name label, within its grid cell."""
-        # Image area (leaves room for label below)
-        img_area_h = cell_h - LABEL_HEIGHT
-        img_x = x + CELL_PADDING
-        img_y = y + CELL_PADDING
-        img_w = cell_w - 2 * CELL_PADDING
-        img_h = img_area_h - CELL_PADDING
-
-        if img_w <= 0 or img_h <= 0:
-            return
-
-        try:
-            bird_img = Image.open(str(path)).convert("RGB")
-            bird_img = self._fit_image(bird_img, img_w, img_h)
-
-            # Centre within the cell's image area
-            offset_x = img_x + (img_w - bird_img.width) // 2
-            offset_y = img_y + (img_h - bird_img.height) // 2
-            img.paste(bird_img, (offset_x, offset_y))
-
-        except Exception as exc:
-            logger.warning("Could not load artwork %s: %s", path, exc)
-            # Draw a placeholder rectangle
-            draw.rectangle(
-                [img_x, img_y, img_x + img_w, img_y + img_h],
-                outline=(180, 160, 130),
-                width=2,
-            )
-
-        # Species name label below the image
-        label_y = y + cell_h - LABEL_HEIGHT + 8
-        self._draw_species_label(draw, ImageFont, x, label_y, cell_w, common, sci)
-
-    def _draw_species_label(
-        self, draw, ImageFont,
-        cell_x, label_y, cell_w,
-        common_name: str,
-        scientific_name: str,
-    ) -> None:
-        """Draw common name and scientific name below the artwork."""
-        common_font = self._get_font(ImageFont, size=18, bold=True)
-        sci_font = self._get_font(ImageFont, size=14, italic=True)
-
-        # Common name — centred
-        cb = draw.textbbox((0, 0), common_name, font=common_font)
-        cw = cb[2] - cb[0]
-        cx = cell_x + (cell_w - cw) // 2
-        draw.text((cx, label_y), common_name, fill=SPECIES_COLOUR, font=common_font)
-
-        # Scientific name — centred below
-        sb = draw.textbbox((0, 0), scientific_name, font=sci_font)
-        sw = sb[2] - sb[0]
-        sx = cell_x + (cell_w - sw) // 2
-        draw.text((sx, label_y + 24), scientific_name,
-                  fill=SUBTITLE_COLOUR, font=sci_font)
-
     # ------------------------------------------------------------------
-    # Utilities
+    # Grid layout (kept for tests and fallback)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _grid_dimensions(n: int) -> tuple[int, int]:
-        """
-        Return (cols, rows) for a grid that fits n items.
-
-        Prefers wider layouts (more columns than rows) to suit
-        landscape display orientation.
-        """
         if n <= 0:
             return 1, 1
         if n == 1:
@@ -340,7 +351,6 @@ class CollageGenerator:
 
     @staticmethod
     def _fit_image(img, max_w: int, max_h: int):
-        """Resize img to fit within max_w × max_h, preserving aspect ratio."""
         iw, ih = img.size
         if iw == 0 or ih == 0:
             return img
@@ -353,41 +363,100 @@ class CollageGenerator:
     @staticmethod
     def _get_font(ImageFont, size: int = 16,
                   bold: bool = False, italic: bool = False):
-        """
-        Return a PIL ImageFont. Falls back to the built-in default font
-        if no system fonts are available (which is always safe).
-        """
-        # Try common system font names in order of preference
         candidates = []
-        if bold and italic:
-            candidates = [
-                "georgiabi.ttf", "timesbi.ttf", "trebucbi.ttf",
-            ]
-        elif bold:
-            candidates = [
-                "georgiab.ttf", "timesbd.ttf", "trebucbd.ttf",
-                "arialbd.ttf", "calibrib.ttf",
-            ]
+        if bold:
+            candidates = ["georgiab.ttf", "timesbd.ttf", "trebucbd.ttf",
+                          "arialbd.ttf", "calibrib.ttf"]
         elif italic:
-            candidates = [
-                "georgiai.ttf", "timesi.ttf", "trebucit.ttf",
-                "ariali.ttf",
-            ]
+            candidates = ["georgiai.ttf", "timesi.ttf", "ariali.ttf"]
         else:
-            candidates = [
-                "georgia.ttf", "times.ttf", "trebuc.ttf",
-                "arial.ttf", "calibri.ttf",
-            ]
-
+            candidates = ["georgia.ttf", "times.ttf", "trebuc.ttf",
+                          "arial.ttf", "calibri.ttf"]
         for name in candidates:
             try:
                 return ImageFont.truetype(name, size)
             except (OSError, IOError):
                 continue
-
-        # Final fallback: PIL default bitmap font (always available)
         try:
             return ImageFont.load_default(size=size)
         except TypeError:
-            # Older Pillow versions don't accept size
             return ImageFont.load_default()
+
+
+# ---------------------------------------------------------------------------
+# Module-level utilities
+# ---------------------------------------------------------------------------
+
+def _fit_to_width(img, target_w: int):
+    from PIL import Image
+    iw, ih = img.size
+    if iw == 0:
+        return img
+    scale = target_w / iw
+    new_w = max(1, int(iw * scale))
+    new_h = max(1, int(ih * scale))
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
+def _generate_candidates(
+    max_x: int,
+    max_y: int,
+    n: int,
+    rng: random.Random,
+) -> list[tuple[int, int]]:
+    """
+    Generate n candidate (x, y) positions using grid jitter.
+
+    Divides the canvas into a grid and samples one jittered point
+    per cell, ensuring candidates are spread across the full canvas
+    rather than clustered in one area.
+    """
+    if max_x <= 0 or max_y <= 0:
+        return [(0, 0)] * n
+
+    # Grid dimensions
+    cols = max(1, int(math.sqrt(n * max_x / max(1, max_y))))
+    rows = max(1, math.ceil(n / cols))
+    cell_w = max_x // cols
+    cell_h = max_y // rows
+
+    candidates = []
+    for row in range(rows):
+        for col in range(cols):
+            if len(candidates) >= n:
+                break
+            base_x = col * cell_w
+            base_y = row * cell_h
+            jx = rng.randint(0, max(0, cell_w - 1))
+            jy = rng.randint(0, max(0, cell_h - 1))
+            candidates.append((base_x + jx, base_y + jy))
+
+    # Top up with pure random candidates if grid didn't produce enough
+    while len(candidates) < n:
+        candidates.append((
+            rng.randint(0, max_x),
+            rng.randint(0, max_y),
+        ))
+
+    rng.shuffle(candidates)
+    return candidates[:n]
+
+
+def _overlap_area(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2) -> int:
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0
+    return (ix2 - ix1) * (iy2 - iy1)
+
+
+def _total_overlap(
+    x: int, y: int, w: int, h: int,
+    placed: list[tuple[int, int, int, int]],
+) -> int:
+    return sum(
+        _overlap_area(x, y, x + w, y + h, px1, py1, px2, py2)
+        for px1, py1, px2, py2 in placed
+    )
