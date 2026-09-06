@@ -1,9 +1,10 @@
 """
 Species endpoints.
 
-GET /api/species                — all known species
-GET /api/species/{id}           — single species with stats
-GET /api/heard-recently         — recently detected species
+GET /api/species                    — all known species
+GET /api/species/{id}               — single species with stats
+GET /api/heard-recently             — recently detected species
+GET /api/species-artwork/{stem}     — serve artwork image file
 """
 
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,7 @@ import config
 from backend.api.dependencies import get_db_session, get_repository
 from backend.database.repository import DetectionRepository
 from backend.database.models import Species
+from backend.artwork.static_provider import SUPPORTED_EXTENSIONS
 
 router = APIRouter()
 
@@ -54,11 +57,17 @@ def _species_to_response(
     repo: DetectionRepository,
 ) -> SpeciesResponse:
     count = repo.count_detections(session, species_id=species.id)
+    # Set artwork_path to stem if file exists, else None
+    stem = species.scientific_name.lower().replace(" ", "_")
+    has_artwork = any(
+        (config.ASSETS_DIR / f"{stem}{ext}").exists()
+        for ext in SUPPORTED_EXTENSIONS
+    )
     return SpeciesResponse(
         id=species.id,
         scientific_name=species.scientific_name,
         common_name=species.common_name,
-        artwork_path=species.artwork_path,
+        artwork_path=stem if has_artwork else None,
         detection_count=count,
     )
 
@@ -101,10 +110,7 @@ def heard_recently(
     session: Session = Depends(get_db_session),
     repo: DetectionRepository = Depends(get_repository),
 ):
-    """
-    Return species detected within the last *hours* hours.
-    Ordered by most-recently-detected first.
-    """
+    """Return species detected within the last *hours* hours."""
     species_list = repo.get_recently_heard_species(
         session, hours=hours, limit=limit
     )
@@ -114,4 +120,35 @@ def heard_recently(
         species=[
             _species_to_response(s, session, repo) for s in species_list
         ],
+    )
+
+
+@router.get("/species-artwork/{stem}")
+def get_species_artwork(stem: str):
+    """
+    Serve the artwork image for a species by filename stem.
+
+    stem is the scientific name lowercased with spaces replaced by
+    underscores, e.g. 'erithacus_rubecula'.
+
+    Returns 404 if no artwork file exists for this species.
+    """
+    # Sanitise: only allow safe characters
+    safe_stem = "".join(c for c in stem if c.isalnum() or c == "_")
+    if not safe_stem:
+        raise HTTPException(status_code=400, detail="Invalid species stem.")
+
+    for ext in SUPPORTED_EXTENSIONS:
+        candidate = config.ASSETS_DIR / f"{safe_stem}{ext}"
+        if candidate.exists():
+            media_type = (
+                "image/jpeg" if ext in (".jpg", ".jpeg")
+                else "image/png" if ext == ".png"
+                else "image/webp"
+            )
+            return FileResponse(str(candidate), media_type=media_type)
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No artwork found for species '{safe_stem}'.",
     )
