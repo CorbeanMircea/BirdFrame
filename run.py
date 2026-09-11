@@ -6,13 +6,18 @@ Starts the full audio detection pipeline:
     → DetectionService → SQLite → (API serves results to dashboard)
 
 Usage:
-    python run.py                        # use default microphone
+    python run.py                        # use default microphone, static artwork
+    python run.py --generated-artwork    # use ComfyUI + Flux.1 for artwork
     python run.py --device 5             # use specific device index
     python run.py --mock                 # use MockBirdIdentifier (no model)
     python run.py --list-devices         # print available microphones
 
-Run the API server separately in another terminal:
+Run the API server separately:
     python -m backend.api.main
+
+Run ComfyUI (for generated artwork):
+    cd C:\\Users\\Gaming_PC\\ComfyUI_windows_portable
+    .\\run_nvidia_gpu.bat
 
 Then open the dashboard:
     http://localhost:3000
@@ -23,6 +28,7 @@ import time
 import signal
 import logging
 import argparse
+import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -40,7 +46,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("birdframe")
 
-# Quiet noisy libraries
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
 logging.getLogger("pydub").setLevel(logging.ERROR)
@@ -69,15 +74,22 @@ def parse_args():
     parser.add_argument(
         "--min-confidence", type=float,
         default=config.IDENTIFIER_MIN_CONFIDENCE,
-        help=f"Minimum confidence to save a detection (default: {config.IDENTIFIER_MIN_CONFIDENCE})",
+        help=f"Minimum confidence (default: {config.IDENTIFIER_MIN_CONFIDENCE})",
     )
     parser.add_argument(
         "--duration", type=float, default=None,
-        help="Stop automatically after this many seconds (default: run forever)",
+        help="Stop automatically after this many seconds",
     )
     parser.add_argument(
         "--location", action="store_true",
-        help="Enable Romanian location filter in BirdNET (lat=45.9, lon=24.9)",
+        help="Enable Romanian location filter (lat=45.9, lon=24.9)",
+    )
+    parser.add_argument(
+        "--generated-artwork", action="store_true",
+        help=(
+            "Use GeneratedArtworkProvider (ComfyUI + Flux.1). "
+            "ComfyUI must be running at http://127.0.0.1:8188"
+        ),
     )
     return parser.parse_args()
 
@@ -109,13 +121,16 @@ def build_identifier(args):
         import datetime
         lat, lon = 45.9, 24.9
         week = int(datetime.date.today().strftime("%W")) + 1
-        logger.info("Location filter: Romania (lat=%.1f lon=%.1f week=%d)", lat, lon, week)
+        logger.info(
+            "Location filter: Romania (lat=%.1f lon=%.1f week=%d)",
+            lat, lon, week,
+        )
 
     return BirdNetIdentifier(
         latitude=lat,
         longitude=lon,
         week=week,
-        min_confidence=0.05,  # permissive — DetectionService filters further
+        min_confidence=0.05,
     )
 
 
@@ -136,7 +151,7 @@ def build_service(identifier, args):
         min_confidence=args.min_confidence,
         segment_duration=config.AUDIO_CHUNK_DURATION,
         overlap_duration=config.AUDIO_CHUNK_OVERLAP,
-        target_sample_rate=48_000,  # BirdNET expects 48 kHz
+        target_sample_rate=48_000,
         enable_grouping=True,
     )
 
@@ -166,6 +181,15 @@ def main():
         list_devices()
         return
 
+    # Set artwork backend env var before importing anything that reads it
+    if args.generated_artwork:
+        os.environ["BIRDFRAME_ARTWORK"] = "generated"
+        # Reload config to pick up the env var
+        import importlib
+        importlib.reload(config)
+
+    artwork_backend = "generated" if args.generated_artwork else "static"
+
     print("\n" + "=" * 60)
     print("  BirdFrame — Live Detection Pipeline")
     print("=" * 60)
@@ -176,19 +200,32 @@ def main():
     print(f"  Overlap    : {config.AUDIO_CHUNK_OVERLAP}s")
     print(f"  Min conf.  : {args.min_confidence}")
     print(f"  Location   : {'Romania' if args.location else 'disabled'}")
+    print(f"  Artwork    : {artwork_backend}")
     print(f"  Duration   : {args.duration or 'unlimited'}")
     print("=" * 60)
     print("  Dashboard  : http://localhost:3000")
     print("  API docs   : http://127.0.0.1:8000/docs")
+    if args.generated_artwork:
+        print("  ComfyUI    : http://127.0.0.1:8188")
     print("=" * 60)
     print("  Press Ctrl+C to stop.\n")
 
-    # Build pipeline
+    if args.generated_artwork:
+        # Verify ComfyUI is reachable before starting
+        from backend.artwork.generated_provider import GeneratedArtworkProvider
+        probe = GeneratedArtworkProvider()
+        if not probe._ping_comfyui():
+            print("  ✗ ERROR: ComfyUI is not running at http://127.0.0.1:8188")
+            print("  Start ComfyUI first:")
+            print(r"    cd C:\Users\Gaming_PC\ComfyUI_windows_portable")
+            print(r"    .\run_nvidia_gpu.bat")
+            return
+        print("  ✓ ComfyUI reachable\n")
+
     identifier = build_identifier(args)
     service = build_service(identifier, args)
     recorder = build_recorder(service, args)
 
-    # Graceful shutdown on Ctrl+C
     shutdown_requested = False
 
     def _shutdown(sig, frame):
@@ -200,7 +237,6 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # Start pipeline
     logger.info("Starting detection service…")
     service.start()
 
@@ -210,7 +246,6 @@ def main():
     except Exception as exc:
         logger.error("Failed to start recorder: %s", exc)
         logger.info("Try --list-devices to see available microphones.")
-        logger.info("Use --device <index> to select a specific microphone.")
         service.stop()
         return
 
@@ -223,7 +258,6 @@ def main():
         while not shutdown_requested:
             time.sleep(1.0)
 
-            # Print stats every 30 seconds
             now = time.time()
             if now - last_stats_time >= 30:
                 stats = service.get_stats()
@@ -238,7 +272,6 @@ def main():
                 )
                 last_stats_time = now
 
-            # Auto-stop after duration
             if args.duration and (time.time() - start_time) >= args.duration:
                 logger.info("Duration reached — stopping.")
                 break
@@ -247,7 +280,6 @@ def main():
         recorder.stop()
         service.stop()
 
-        # Final summary
         stats = service.get_stats()
         elapsed = int(time.time() - start_time)
         print("\n" + "=" * 60)
@@ -259,8 +291,9 @@ def main():
         print(f"  Segments accepted: {stats['segments_accepted']}")
         print(f"  Detections saved : {stats['detections_saved']}")
         print(f"  Events created   : {stats['events_created_or_extended']}")
+        print(f"  Artwork backend  : {artwork_backend}")
         print("=" * 60)
-        print(f"  View results at  : http://localhost:3000")
+        print(f"  Dashboard        : http://localhost:3000")
         print("=" * 60 + "\n")
 
 

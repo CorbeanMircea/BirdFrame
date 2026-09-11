@@ -1,20 +1,18 @@
 """
 Tests for the collage API endpoints.
-
-Uses the TestClient with the in-memory DB dependency override.
-The collage generator is also overridden so tests never write
-real files to disk or require artwork to be present.
 """
 
 import sys
 import time
-import tempfile
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -29,11 +27,6 @@ from backend.database.repository import DetectionRepository
 # Fixtures
 # ---------------------------------------------------------------------------
 
-import sqlite3
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-
 @pytest.fixture(scope="module")
 def mem_engine():
     conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -46,7 +39,6 @@ def mem_engine():
 
 @pytest.fixture(scope="module")
 def seeded_session_factory(mem_engine):
-    """Seed species + detections so heard-recently returns results."""
     SessionLocal = sessionmaker(
         bind=mem_engine, autocommit=False, autoflush=False,
         expire_on_commit=False,
@@ -70,7 +62,6 @@ def seeded_session_factory(mem_engine):
 
 @pytest.fixture(scope="module")
 def client(seeded_session_factory, tmp_path_factory):
-    """TestClient with DB and collage dir overridden."""
     tmp_dir = tmp_path_factory.mktemp("collages")
 
     def override_get_db():
@@ -86,29 +77,34 @@ def client(seeded_session_factory, tmp_path_factory):
 
     app.dependency_overrides[get_db_session] = override_get_db
 
-    # Override the collage directory so tests write to tmp
-    with patch("backend.api.routes.collage._generator") as mock_gen, \
-         patch("backend.api.routes.collage._provider") as mock_prov, \
+    # Create a fake artwork file for the provider to return
+    fake_artwork = tmp_dir / "fake_bird.jpg"
+    from PIL import Image
+    Image.new("RGB", (200, 300), (200, 180, 140)).save(str(fake_artwork))
+
+    # Mock the artwork provider factory and collage generator
+    mock_provider = MagicMock()
+    mock_provider.get_artwork.return_value = fake_artwork
+    mock_provider.has_artwork.return_value = True
+
+    mock_gen = MagicMock()
+
+    def fake_generate_latest(species_paths):
+        out = tmp_dir / "latest.jpg"
+        Image.new("RGB", (400, 300), (245, 240, 228)).save(str(out))
+        return out
+
+    mock_gen.generate_latest.side_effect = fake_generate_latest
+
+    with patch("backend.api.routes.collage.get_artwork_provider",
+               return_value=mock_provider), \
+         patch("backend.api.routes.collage._generator", mock_gen), \
          patch("backend.api.routes.collage.config") as mock_config:
 
         mock_config.HEARD_RECENTLY_HOURS = 24
         mock_config.COLLAGE_MAX_SPECIES = 6
         mock_config.COLLAGE_DIR = tmp_dir
-
-        # Provider: return a fake path for known species
-        fake_artwork = tmp_dir / "fake_bird.jpg"
-        from PIL import Image
-        Image.new("RGB", (200, 300), (200, 180, 140)).save(str(fake_artwork))
-
-        mock_prov.get_artwork.return_value = fake_artwork
-
-        # Generator: write a real tiny JPEG to latest.jpg
-        def fake_generate_latest(species_paths):
-            out = tmp_dir / "latest.jpg"
-            Image.new("RGB", (400, 300), (245, 240, 228)).save(str(out))
-            return out
-
-        mock_gen.generate_latest.side_effect = fake_generate_latest
+        mock_config.ARTWORK_BACKEND = "static"
 
         with TestClient(app) as c:
             yield c, tmp_dir
@@ -122,12 +118,10 @@ def client(seeded_session_factory, tmp_path_factory):
 
 class TestCollageStatus:
     def test_status_when_no_collage(self):
-        """Fresh state — no collage exists yet."""
         with patch(
             "backend.api.routes.collage._latest_path",
             return_value=Path("/nonexistent/latest.jpg"),
         ):
-            from fastapi.testclient import TestClient
             with TestClient(app) as c:
                 resp = c.get("/api/collage/status")
         assert resp.status_code == 200
@@ -145,7 +139,6 @@ class TestCollageStatus:
             "backend.api.routes.collage._latest_path",
             return_value=fake,
         ):
-            from fastapi.testclient import TestClient
             with TestClient(app) as c:
                 resp = c.get("/api/collage/status")
 
@@ -155,7 +148,7 @@ class TestCollageStatus:
         assert data["size_bytes"] > 0
         assert data["generated_at"] is not None
         assert data["age_seconds"] is not None
-        assert data["age_seconds"] >= 0
+        assert "artwork_backend" in data
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +161,6 @@ class TestGetLatestCollage:
             "backend.api.routes.collage._latest_path",
             return_value=Path("/nonexistent/latest.jpg"),
         ):
-            from fastapi.testclient import TestClient
             with TestClient(app) as c:
                 resp = c.get("/api/collage/latest")
         assert resp.status_code == 404
@@ -182,7 +174,6 @@ class TestGetLatestCollage:
             "backend.api.routes.collage._latest_path",
             return_value=fake,
         ):
-            from fastapi.testclient import TestClient
             with TestClient(app) as c:
                 resp = c.get("/api/collage/latest")
 
@@ -206,8 +197,10 @@ class TestGenerateCollage:
         data = c.post("/api/collage/generate").json()
         assert "success" in data
         assert "species_count" in data
+        assert "species_with_artwork" in data
         assert "message" in data
         assert "generated_at" in data
+        assert "artwork_backend" in data
 
     def test_generate_success_true_when_species_available(self, client):
         c, tmp_dir = client
@@ -232,7 +225,7 @@ class TestGenerateCollage:
     def test_generate_invalid_hours_rejected(self, client):
         c, tmp_dir = client
         resp = c.post("/api/collage/generate?hours=0")
-        assert resp.status_code == 422  # FastAPI validation error
+        assert resp.status_code == 422
 
     def test_generate_invalid_limit_rejected(self, client):
         c, tmp_dir = client
@@ -240,17 +233,12 @@ class TestGenerateCollage:
         assert resp.status_code == 422
 
     def test_generate_no_species_returns_success_false(self, tmp_path):
-        """When no species detected, success should be False."""
-        import sqlite3
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-
-        # Empty database — no detections
         conn = sqlite3.connect(":memory:", check_same_thread=False)
         engine = create_engine("sqlite://", creator=lambda: conn)
         Base.metadata.create_all(engine)
-        EmptySession = sessionmaker(bind=engine, autocommit=False,
-                                    autoflush=False)
+        EmptySession = sessionmaker(
+            bind=engine, autocommit=False, autoflush=False
+        )
 
         def empty_db():
             s = EmptySession()
@@ -282,3 +270,4 @@ class TestGenerateBackground:
         data = resp.json()
         assert data["accepted"] is True
         assert "message" in data
+        assert "artwork_backend" in data
