@@ -3,7 +3,7 @@ DetectionService — orchestrates the full bird detection pipeline.
 
 Wires together:
     AudioProcessor → BirdDetector → BirdIdentifier
-    → DetectionRepository → DetectionGrouper
+    → DetectionRepository → DetectionGrouper → ArtworkTrigger
 
 Data flow:
 
@@ -11,26 +11,14 @@ Data flow:
         └─► DetectionService.handle_chunk(chunk, sample_rate)
                 └─► AudioProcessor
                         └─► [segment ready]
-                                └─► BirdDetector.is_bird_audio()
+                                └─► BirdDetector
                                         └─► [if accepted]
-                                                └─► BirdIdentifier.identify()
+                                                └─► BirdIdentifier
                                                         └─► [filter by confidence]
-                                                                └─► DetectionRepository (save Detection)
-                                                                        └─► DetectionGrouper (group into Event)
-
-Usage:
-
-    from backend.detection.service import DetectionService
-    from backend.identification.mock_identifier import MockBirdIdentifier
-
-    service = DetectionService(identifier=MockBirdIdentifier())
-    service.start()
-
-    recorder = AudioRecorder(callback=service.handle_chunk)
-    recorder.start()
-    ...
-    recorder.stop()
-    service.stop()
+                                                                └─► DetectionRepository
+                                                                        └─► DetectionGrouper
+                                                                                └─► ArtworkTrigger
+                                                                                    (background)
 """
 
 import sys
@@ -58,7 +46,6 @@ SessionFactory = Callable[[], object]
 
 
 class DetectionServiceError(Exception):
-    """Raised when DetectionService encounters an unrecoverable error."""
     pass
 
 
@@ -69,27 +56,19 @@ class DetectionService:
     Parameters
     ----------
     identifier : BirdIdentifier
-        The identification backend to use.
     detector : BirdDetector | None
-        Pre-filter. Defaults to a BirdDetector from config values.
     processor : AudioProcessor | None
-        Audio chunker. Defaults to one built from config values.
     repository : DetectionRepository | None
-        Database access. Defaults to a new DetectionRepository.
     grouper : DetectionGrouper | None
-        Groups consecutive detections into events. Defaults to a new
-        DetectionGrouper. Pass None to disable grouping entirely.
+    artwork_trigger : ArtworkTrigger | None
+        If provided, called after each detection to trigger background
+        artwork generation for new species.
     session_factory : callable | None
-        Zero-argument callable returning a SQLAlchemy Session.
-        Defaults to get_session(). Inject a custom factory in tests.
     min_confidence : float
-        Minimum confidence for a result to be persisted.
     segment_duration : float
-        Segment length for the auto-created AudioProcessor.
     overlap_duration : float
-        Overlap for the auto-created AudioProcessor.
     target_sample_rate : int | None
-        Resample target for the auto-created AudioProcessor.
+    enable_grouping : bool
     """
 
     def __init__(
@@ -99,6 +78,7 @@ class DetectionService:
         processor: Optional[AudioProcessor] = None,
         repository: Optional[DetectionRepository] = None,
         grouper: Optional[DetectionGrouper] = None,
+        artwork_trigger=None,
         session_factory: Optional[SessionFactory] = None,
         min_confidence: float = config.IDENTIFIER_MIN_CONFIDENCE,
         segment_duration: float = config.AUDIO_CHUNK_DURATION,
@@ -110,12 +90,12 @@ class DetectionService:
         self._detector = detector or BirdDetector()
         self._repository = repository or DetectionRepository()
         self._session_factory = session_factory or get_session
+        self._artwork_trigger = artwork_trigger
         self._min_confidence = min_confidence
         self._lock = threading.Lock()
         self._running = False
         self._enable_grouping = enable_grouping
 
-        # Grouper: use provided, or create default, or disable
         if grouper is not None:
             self._grouper: Optional[DetectionGrouper] = grouper
         elif enable_grouping:
@@ -123,12 +103,13 @@ class DetectionService:
         else:
             self._grouper = None
 
-        # Stats counters
+        # Stats
         self._chunks_received: int = 0
         self._segments_analysed: int = 0
         self._segments_accepted: int = 0
         self._detections_saved: int = 0
         self._events_created_or_extended: int = 0
+        self._artwork_triggered: int = 0
 
         if processor is not None:
             self._processor = processor
@@ -140,12 +121,6 @@ class DetectionService:
                 target_sample_rate=target_sample_rate,
             )
 
-        logger.debug(
-            "DetectionService created: identifier=%r min_confidence=%.2f "
-            "grouping=%s",
-            identifier.model_name, min_confidence, enable_grouping,
-        )
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -155,15 +130,8 @@ class DetectionService:
         return self._running
 
     def start(self) -> None:
-        """
-        Prepare the service for operation.
-
-        Ensures the DB schema exists (when using the default session
-        factory) and warms up the identifier.
-        """
         with self._lock:
             if self._running:
-                logger.warning("DetectionService.start() called while already running.")
                 return
 
             logger.info("DetectionService starting…")
@@ -178,43 +146,58 @@ class DetectionService:
                     f"Identifier warmup failed: {exc}"
                 ) from exc
 
+            # Start artwork trigger if provided
+            if self._artwork_trigger is not None:
+                self._artwork_trigger.start()
+                if self._artwork_trigger.is_running:
+                    logger.info(
+                        "ArtworkTrigger active — new species will auto-generate artwork."
+                    )
+                else:
+                    logger.info(
+                        "ArtworkTrigger inactive (ComfyUI unavailable or "
+                        "static backend)."
+                    )
+
             self._running = True
             logger.info(
-                "DetectionService started (identifier=%s %s grouping=%s).",
+                "DetectionService started (identifier=%s %s grouping=%s artwork_trigger=%s).",
                 self._identifier.model_name,
                 self._identifier.model_version,
                 self._enable_grouping,
+                self._artwork_trigger is not None,
             )
 
     def stop(self) -> None:
-        """Stop the service, close stale events, and reset the processor."""
         with self._lock:
             if not self._running:
                 return
 
-            # Close any events that are still open
             if self._grouper is not None:
                 try:
                     with self._session_factory() as session:
                         closed = self._grouper.close_stale_events(session)
                         session.commit()
                         if closed:
-                            logger.info(
-                                "Closed %d stale event(s) on stop.", closed
-                            )
+                            logger.info("Closed %d stale event(s).", closed)
                 except Exception as exc:
-                    logger.error("Error closing stale events on stop: %s", exc)
+                    logger.error("Error closing stale events: %s", exc)
+
+            if self._artwork_trigger is not None:
+                self._artwork_trigger.stop()
 
             self._processor.reset()
             self._running = False
             logger.info(
                 "DetectionService stopped. "
-                "chunks=%d analysed=%d accepted=%d saved=%d events=%d",
+                "chunks=%d analysed=%d accepted=%d saved=%d "
+                "events=%d artwork_triggered=%d",
                 self._chunks_received,
                 self._segments_analysed,
                 self._segments_accepted,
                 self._detections_saved,
                 self._events_created_or_extended,
+                self._artwork_triggered,
             )
 
     # ------------------------------------------------------------------
@@ -222,30 +205,21 @@ class DetectionService:
     # ------------------------------------------------------------------
 
     def handle_chunk(self, chunk: np.ndarray, sample_rate: int) -> None:
-        """
-        Accept a raw audio chunk from AudioRecorder.
-
-        Pass this as the callback:
-            recorder = AudioRecorder(callback=service.handle_chunk)
-        """
         if not self._running:
             return
-
         self._chunks_received += 1
         try:
             self._processor.process(chunk, sample_rate)
         except Exception as exc:
-            logger.error("AudioProcessor error in handle_chunk: %s", exc)
+            logger.error("AudioProcessor error: %s", exc)
 
     # ------------------------------------------------------------------
-    # Internal pipeline stages
+    # Pipeline stages
     # ------------------------------------------------------------------
 
     def _on_segment(self, segment: np.ndarray, sample_rate: int) -> None:
-        """Called by AudioProcessor when a complete segment is ready."""
         self._segments_analysed += 1
 
-        # Stage 1: pre-filter
         try:
             det_result = self._detector.analyse(segment, sample_rate)
         except Exception as exc:
@@ -253,12 +227,10 @@ class DetectionService:
             return
 
         if not det_result.accepted:
-            logger.debug("Segment rejected: %s", det_result.rejection_reason)
             return
 
         self._segments_accepted += 1
 
-        # Stage 2: identify
         segment_start = datetime.now(timezone.utc)
         try:
             candidates = self._identifier.identify_and_filter(
@@ -271,10 +243,8 @@ class DetectionService:
             return
 
         if not candidates:
-            logger.debug("Identifier returned no results above threshold.")
             return
 
-        # Stage 3: persist + group
         self._persist_and_group(
             candidates, segment_start, len(segment) / sample_rate
         )
@@ -285,18 +255,15 @@ class DetectionService:
         timestamp: datetime,
         duration_seconds: float,
     ) -> None:
-        """Save detections to the DB and run the grouper on each."""
         try:
             with self._session_factory() as session:
                 for result in candidates:
-                    # Save species
                     species = self._repository.get_or_create_species(
                         session,
                         scientific_name=result.scientific_name,
                         common_name=result.common_name,
                     )
 
-                    # Save detection
                     detection = self._repository.add_detection(
                         session,
                         species_id=species.id,
@@ -308,16 +275,23 @@ class DetectionService:
                     )
                     self._detections_saved += 1
 
-                    # Group into event
                     if self._grouper is not None:
                         try:
                             self._grouper.process(session, detection)
                             self._events_created_or_extended += 1
                         except Exception as exc:
-                            logger.error(
-                                "DetectionGrouper error for %s: %s",
-                                result.scientific_name, exc,
+                            logger.error("DetectionGrouper error: %s", exc)
+
+                    # Trigger artwork generation for new species
+                    if self._artwork_trigger is not None:
+                        try:
+                            self._artwork_trigger.on_detection(
+                                result.scientific_name,
+                                result.common_name,
                             )
+                            self._artwork_triggered += 1
+                        except Exception as exc:
+                            logger.error("ArtworkTrigger error: %s", exc)
 
                     logger.info(
                         "Saved: %s confidence=%.2f",
@@ -334,7 +308,18 @@ class DetectionService:
     # ------------------------------------------------------------------
 
     def get_stats(self) -> dict:
-        """Return pipeline counters for monitoring / API."""
+        artwork_stats = {}
+        if self._artwork_trigger is not None:
+            artwork_stats = {
+                "artwork_trigger_active": self._artwork_trigger.is_running,
+                "artwork_in_progress": list(
+                    self._artwork_trigger.species_in_progress
+                ),
+                "artwork_completed": list(
+                    self._artwork_trigger.species_completed
+                ),
+            }
+
         return {
             "running": self._running,
             "chunks_received": self._chunks_received,
@@ -342,14 +327,17 @@ class DetectionService:
             "segments_accepted": self._segments_accepted,
             "detections_saved": self._detections_saved,
             "events_created_or_extended": self._events_created_or_extended,
+            "artwork_triggered": self._artwork_triggered,
             "grouping_enabled": self._enable_grouping,
             "identifier": self._identifier.model_name,
             "identifier_version": self._identifier.model_version,
+            **artwork_stats,
         }
 
     def __repr__(self) -> str:
         return (
             f"<DetectionService running={self._running} "
             f"identifier={self._identifier.model_name!r} "
-            f"grouping={self._enable_grouping}>"
+            f"grouping={self._enable_grouping} "
+            f"artwork_trigger={self._artwork_trigger is not None}>"
         )
