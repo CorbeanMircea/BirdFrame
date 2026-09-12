@@ -44,7 +44,10 @@ def get_artwork_provider(backend: str | None = None) -> ArtworkProvider:
             width=768,
             height=768,
         )
-        logger.info("Using GeneratedArtworkProvider (ComfyUI + Flux.1)")
+        logger.info(
+            "Using GeneratedArtworkProvider (ComfyUI + Flux.1, %d steps)",
+            config.COMFYUI_STEPS,
+        )
         return provider
 
     # Default: static
