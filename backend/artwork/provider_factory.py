@@ -40,7 +40,7 @@ def get_artwork_provider(backend: str | None = None) -> ArtworkProvider:
         provider = GeneratedArtworkProvider(
             comfyui_url=config.COMFYUI_URL,
             comfyui_output_dir=Path(config.COMFYUI_OUTPUT_DIR),
-            steps=20,
+            steps=config.COMFYUI_STEPS,
             width=768,
             height=768,
         )

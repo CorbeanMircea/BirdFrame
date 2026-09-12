@@ -80,6 +80,7 @@ COMFYUI_OUTPUT_DIR: str = os.getenv(
     "COMFYUI_OUTPUT_DIR",
     r"C:\Users\Gaming_PC\ComfyUI_windows_portable\ComfyUI\output",
 )
+COMFYUI_STEPS: int = int(os.getenv("COMFYUI_STEPS", "30"))
 
 # ---------------------------------------------------------------------------
 # Collage

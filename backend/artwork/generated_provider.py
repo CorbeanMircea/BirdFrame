@@ -91,7 +91,7 @@ class GeneratedArtworkProvider(ArtworkProvider):
     comfyui_output_dir : Path | None
         ComfyUI's output directory. Default: auto-detected from portable path.
     steps : int
-        Sampling steps (20 = good quality, 4 = fast draft).
+        Sampling steps (30 = good quality, 4 = fast draft).
     width, height : int
         Output image dimensions.
     force_regenerate : bool
@@ -103,7 +103,7 @@ class GeneratedArtworkProvider(ArtworkProvider):
         comfyui_url: str = COMFYUI_URL,
         cache_dir: Optional[Path] = None,
         comfyui_output_dir: Optional[Path] = None,
-        steps: int = 20,
+        steps: int = 30,
         width: int = 768,
         height: int = 768,
         force_regenerate: bool = False,
