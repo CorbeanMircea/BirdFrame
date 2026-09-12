@@ -26,6 +26,8 @@ from backend.artwork.static_provider import SUPPORTED_EXTENSIONS
 
 router = APIRouter()
 
+GENERATED_DIR = config.ASSETS_DIR / "generated"
+
 
 # ---------------------------------------------------------------------------
 # Response schemas
@@ -51,23 +53,43 @@ class HeardRecentlyResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _find_artwork_stem(scientific_name: str) -> Optional[str]:
+    """
+    Return artwork stem if any artwork exists for this species.
+
+    Priority:
+    1. Generated cut-out PNG (assets/artwork/generated/<stem>.png)
+    2. Static illustration (assets/artwork/<stem>.jpg/png/etc)
+
+    Returns None if no artwork found.
+    """
+    stem = scientific_name.lower().replace(" ", "_")
+
+    # Generated artwork takes priority
+    generated_path = GENERATED_DIR / f"{stem}.png"
+    if generated_path.exists():
+        return f"generated/{stem}"
+
+    # Fall back to static only if no generated artwork
+    for ext in SUPPORTED_EXTENSIONS:
+        if (config.ASSETS_DIR / f"{stem}{ext}").exists():
+            return stem
+
+    return None
+
+
 def _species_to_response(
     species: Species,
     session,
     repo: DetectionRepository,
 ) -> SpeciesResponse:
     count = repo.count_detections(session, species_id=species.id)
-    # Set artwork_path to stem if file exists, else None
-    stem = species.scientific_name.lower().replace(" ", "_")
-    has_artwork = any(
-        (config.ASSETS_DIR / f"{stem}{ext}").exists()
-        for ext in SUPPORTED_EXTENSIONS
-    )
+    artwork_stem = _find_artwork_stem(species.scientific_name)
     return SpeciesResponse(
         id=species.id,
         scientific_name=species.scientific_name,
         common_name=species.common_name,
-        artwork_path=stem if has_artwork else None,
+        artwork_path=artwork_stem,
         detection_count=count,
     )
 
@@ -81,7 +103,6 @@ def list_species(
     session: Session = Depends(get_db_session),
     repo: DetectionRepository = Depends(get_repository),
 ):
-    """Return all known species, alphabetically by common name."""
     species_list = repo.list_species(session)
     return [_species_to_response(s, session, repo) for s in species_list]
 
@@ -92,7 +113,6 @@ def get_species(
     session: Session = Depends(get_db_session),
     repo: DetectionRepository = Depends(get_repository),
 ):
-    """Return a single species by ID with detection count."""
     species = repo.get_species_by_id(session, species_id)
     if species is None:
         raise HTTPException(status_code=404, detail="Species not found")
@@ -101,16 +121,11 @@ def get_species(
 
 @router.get("/heard-recently", response_model=HeardRecentlyResponse)
 def heard_recently(
-    hours: int = Query(
-        default=config.HEARD_RECENTLY_HOURS, ge=1, le=168
-    ),
-    limit: int = Query(
-        default=config.COLLAGE_MAX_SPECIES, ge=1, le=20
-    ),
+    hours: int = Query(default=config.HEARD_RECENTLY_HOURS, ge=1, le=168),
+    limit: int = Query(default=config.COLLAGE_MAX_SPECIES, ge=1, le=20),
     session: Session = Depends(get_db_session),
     repo: DetectionRepository = Depends(get_repository),
 ):
-    """Return species detected within the last *hours* hours."""
     species_list = repo.get_recently_heard_species(
         session, hours=hours, limit=limit
     )
@@ -123,20 +138,28 @@ def heard_recently(
     )
 
 
-@router.get("/species-artwork/{stem}")
+@router.get("/species-artwork/{stem:path}")
 def get_species_artwork(stem: str):
     """
-    Serve the artwork image for a species by filename stem.
+    Serve artwork image for a species.
 
-    stem is the scientific name lowercased with spaces replaced by
-    underscores, e.g. 'erithacus_rubecula'.
-
-    Returns 404 if no artwork file exists for this species.
+    stem formats:
+      "generated/erithacus_rubecula"  → generated PNG cut-out
+      "erithacus_rubecula"            → static illustration
     """
-    # Sanitise: only allow safe characters
+    if stem.startswith("generated/"):
+        safe_name = stem[len("generated/"):]
+        safe_name = "".join(c for c in safe_name if c.isalnum() or c == "_")
+        if not safe_name:
+            raise HTTPException(status_code=400, detail="Invalid stem.")
+        path = GENERATED_DIR / f"{safe_name}.png"
+        if path.exists():
+            return FileResponse(str(path), media_type="image/png")
+        raise HTTPException(status_code=404, detail=f"No generated artwork for '{safe_name}'.")
+
     safe_stem = "".join(c for c in stem if c.isalnum() or c == "_")
     if not safe_stem:
-        raise HTTPException(status_code=400, detail="Invalid species stem.")
+        raise HTTPException(status_code=400, detail="Invalid stem.")
 
     for ext in SUPPORTED_EXTENSIONS:
         candidate = config.ASSETS_DIR / f"{safe_stem}{ext}"
@@ -148,7 +171,4 @@ def get_species_artwork(stem: str):
             )
             return FileResponse(str(candidate), media_type=media_type)
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"No artwork found for species '{safe_stem}'.",
-    )
+    raise HTTPException(status_code=404, detail=f"No artwork found for '{safe_stem}'.")

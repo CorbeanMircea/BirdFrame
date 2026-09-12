@@ -30,9 +30,10 @@ from backend.collage.generator import CollageGenerator, CollageGeneratorError
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Module-level singletons
 _generator = CollageGenerator()
 _last_generated_at: Optional[float] = None
+
+GENERATED_DIR = config.ASSETS_DIR / "generated"
 
 
 # ---------------------------------------------------------------------------
@@ -75,46 +76,39 @@ def _latest_path() -> Path:
     return config.COLLAGE_DIR / "latest.jpg"
 
 
-def _build_species_paths(
-    session: Session,
-    repo: DetectionRepository,
-    hours: int,
-    limit: int,
-) -> dict:
-    """Query recently heard species and build species_paths dict."""
-    recent_species = repo.get_recently_heard_species(
-        session, hours=hours, limit=limit
-    )
+def _get_artwork_for_species(scientific_name: str, common_name: str) -> Optional[Path]:
+    """
+    Get artwork for a species, checking generated directory first.
+    Falls back to provider if not cached.
+    """
+    stem = scientific_name.lower().replace(" ", "_")
+
+    # Check generated cache first (fastest path — no provider needed)
+    generated_path = GENERATED_DIR / f"{stem}.png"
+    if generated_path.exists():
+        return generated_path
+
+    # Try provider (handles static artwork)
+    backend = config.ARTWORK_BACKEND
     provider = get_artwork_provider()
-
-    species_paths = {}
-    for species in recent_species:
-        # Try scientific name lookup (provider indexes by lowercase)
-        path = provider.get_artwork(
-            species.scientific_name,
-            # Pass common_name for GeneratedArtworkProvider
-            **({"common_name": species.common_name}
-               if hasattr(provider.get_artwork, "__code__")
-               and "common_name" in provider.get_artwork.__code__.co_varnames
-               else {})
-        )
-        species_paths[species.scientific_name] = (
-            species.common_name, path
-        )
-
-    return species_paths
+    try:
+        if backend == "generated":
+            return provider.get_artwork(scientific_name, common_name=common_name)
+        else:
+            return provider.get_artwork(scientific_name)
+    except Exception as exc:
+        logger.warning("Could not get artwork for %s: %s", scientific_name, exc)
+        return None
 
 
 def _generate_collage_now(
-    session: Session,
+    session,
     repo: DetectionRepository,
     hours: int,
     limit: int,
 ) -> CollageGenerateResponse:
-    """Core generation logic."""
     global _last_generated_at
     backend = config.ARTWORK_BACKEND
-    provider = get_artwork_provider()
 
     recent_species = repo.get_recently_heard_species(
         session, hours=hours, limit=limit
@@ -131,17 +125,17 @@ def _generate_collage_now(
             artwork_backend=backend,
         )
 
-    # Build species_paths — call get_artwork with common_name for generated provider
+    # Build species_paths using cached artwork only (don't generate new here)
     species_paths = {}
     for species in recent_species:
-        if backend == "generated":
-            path = provider.get_artwork(
-                species.scientific_name,
-                common_name=species.common_name,
-            )
-        else:
-            path = provider.get_artwork(species.scientific_name)
+        path = _get_artwork_for_species(
+            species.scientific_name, species.common_name
+        )
         species_paths[species.scientific_name] = (species.common_name, path)
+        if path:
+            logger.debug("Artwork found for %s: %s", species.scientific_name, path)
+        else:
+            logger.debug("No artwork for %s", species.scientific_name)
 
     with_artwork = {k: v for k, v in species_paths.items() if v[1] is not None}
 
@@ -152,8 +146,8 @@ def _generate_collage_now(
             species_count=len(species_paths),
             species_with_artwork=0,
             message=(
-                f"{len(species_paths)} species detected but none have artwork. "
-                "For generated artwork, ensure ComfyUI is running."
+                f"{len(species_paths)} species detected but none have artwork yet. "
+                "Artwork is being generated in the background — try again in a minute."
             ),
             generated_at=datetime.now(timezone.utc).isoformat(),
             artwork_backend=backend,
@@ -167,7 +161,7 @@ def _generate_collage_now(
         path=str(output_path),
         species_count=len(species_paths),
         species_with_artwork=len(with_artwork),
-        message=f"Collage generated with {len(with_artwork)} species.",
+        message=f"Collage generated with {len(with_artwork)} of {len(species_paths)} species.",
         generated_at=datetime.now(timezone.utc).isoformat(),
         artwork_backend=backend,
     )
@@ -179,47 +173,36 @@ def _generate_collage_now(
 
 @router.get("/collage/status", response_model=CollageStatusResponse)
 def collage_status():
-    """Return metadata about the latest collage file."""
     path = _latest_path()
-
     if not path.exists():
         return CollageStatusResponse(
-            exists=False,
-            path=None,
-            size_bytes=None,
-            generated_at=None,
-            age_seconds=None,
+            exists=False, path=None, size_bytes=None,
+            generated_at=None, age_seconds=None,
             artwork_backend=config.ARTWORK_BACKEND,
         )
-
     stat = path.stat()
-    mtime = stat.st_mtime
-    age = time.time() - mtime
-
     return CollageStatusResponse(
         exists=True,
         path=str(path),
         size_bytes=stat.st_size,
         generated_at=datetime.fromtimestamp(
-            mtime, tz=timezone.utc
+            stat.st_mtime, tz=timezone.utc
         ).isoformat(),
-        age_seconds=round(age, 1),
+        age_seconds=round(time.time() - stat.st_mtime, 1),
         artwork_backend=config.ARTWORK_BACKEND,
     )
 
 
 @router.get("/collage/latest")
 def get_latest_collage():
-    """Serve the latest collage image as a JPEG file."""
     path = _latest_path()
     if not path.exists():
         raise HTTPException(
             status_code=404,
-            detail="No collage generated yet. POST to /api/collage/generate.",
+            detail="No collage yet. POST to /api/collage/generate.",
         )
     return FileResponse(
-        str(path),
-        media_type="image/jpeg",
+        str(path), media_type="image/jpeg",
         filename="birdframe_collage.jpg",
     )
 
@@ -232,11 +215,8 @@ def generate_collage(
     repo: DetectionRepository = Depends(get_repository),
 ):
     """
-    Generate a new collage from recently detected species.
-
-    Uses the configured artwork backend (static or generated).
-    With generated backend, new species trigger ComfyUI generation
-    (~15-50s per species, cached after first generation).
+    Generate a collage from recently detected species.
+    Uses cached artwork only — generation happens automatically in background.
     """
     try:
         return _generate_collage_now(session, repo, hours, limit)
@@ -244,66 +224,45 @@ def generate_collage(
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
         logger.error("Collage generation error: %s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Collage generation failed: {exc}",
-        )
+        raise HTTPException(status_code=500, detail=f"Failed: {exc}")
 
 
-@router.post(
-    "/collage/generate-species",
-    response_model=SpeciesArtworkResponse,
-)
+@router.post("/collage/generate-species", response_model=SpeciesArtworkResponse)
 def generate_species_artwork(
-    scientific_name: str = Query(..., description="e.g. Erithacus rubecula"),
-    common_name: str = Query(..., description="e.g. European Robin"),
+    scientific_name: str = Query(...),
+    common_name: str = Query(...),
 ):
-    """
-    Pre-generate and cache artwork for a single species.
-
-    Useful for warming up the cache before the collage is needed.
-    With the static backend this just checks if artwork exists.
-    With the generated backend this triggers ComfyUI generation.
-    """
+    """Pre-generate and cache artwork for a single species."""
     backend = config.ARTWORK_BACKEND
-    provider = get_artwork_provider()
+    stem = scientific_name.lower().replace(" ", "_")
 
-    was_cached = provider.has_artwork(scientific_name)
+    # Check if already cached
+    generated_path = GENERATED_DIR / f"{stem}.png"
+    was_cached = generated_path.exists()
 
     try:
+        provider = get_artwork_provider()
         if backend == "generated":
-            path = provider.get_artwork(
-                scientific_name, common_name=common_name
-            )
+            path = provider.get_artwork(scientific_name, common_name=common_name)
         else:
             path = provider.get_artwork(scientific_name)
     except Exception as exc:
         return SpeciesArtworkResponse(
-            scientific_name=scientific_name,
-            common_name=common_name,
-            success=False,
-            cached=was_cached,
-            path=None,
-            message=str(exc),
+            scientific_name=scientific_name, common_name=common_name,
+            success=False, cached=was_cached, path=None, message=str(exc),
         )
 
     if path is None:
         return SpeciesArtworkResponse(
-            scientific_name=scientific_name,
-            common_name=common_name,
-            success=False,
-            cached=was_cached,
-            path=None,
-            message="No artwork available for this species.",
+            scientific_name=scientific_name, common_name=common_name,
+            success=False, cached=was_cached, path=None,
+            message="No artwork available.",
         )
 
     return SpeciesArtworkResponse(
-        scientific_name=scientific_name,
-        common_name=common_name,
-        success=True,
-        cached=was_cached,
-        path=str(path),
-        message="Cached." if was_cached else "Generated and cached.",
+        scientific_name=scientific_name, common_name=common_name,
+        success=True, cached=was_cached, path=str(path),
+        message="Already cached." if was_cached else "Generated and cached.",
     )
 
 
@@ -315,15 +274,10 @@ def generate_collage_background(
     session: Session = Depends(get_db_session),
     repo: DetectionRepository = Depends(get_repository),
 ):
-    """
-    Trigger collage generation as a background task.
-    Returns immediately — poll /api/collage/status to check when ready.
-    """
-    backend = config.ARTWORK_BACKEND
+    """Trigger collage generation as a background task."""
     recent_species = repo.get_recently_heard_species(
         session, hours=hours, limit=limit
     )
-
     species_snapshot = [
         (s.scientific_name, s.common_name) for s in recent_species
     ]
@@ -331,25 +285,20 @@ def generate_collage_background(
     def _run():
         global _last_generated_at
         try:
-            provider = get_artwork_provider()
             species_paths = {}
             for sci, common in species_snapshot:
-                if backend == "generated":
-                    path = provider.get_artwork(sci, common_name=common)
-                else:
-                    path = provider.get_artwork(sci)
+                path = _get_artwork_for_species(sci, common)
                 species_paths[sci] = (common, path)
-            if species_paths:
+            if any(v[1] for v in species_paths.values()):
                 _generator.generate_latest(species_paths)
                 _last_generated_at = time.time()
         except Exception as exc:
             logger.error("Background collage error: %s", exc)
 
     background_tasks.add_task(_run)
-
     return {
         "accepted": True,
-        "message": "Collage generation started in background.",
+        "message": "Collage generation started.",
         "species_queued": len(species_snapshot),
-        "artwork_backend": backend,
+        "artwork_backend": config.ARTWORK_BACKEND,
     }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import CollagePanel from "@/components/CollagePanel";
 import StatsBar from "@/components/StatsBar";
@@ -8,6 +8,8 @@ import RecentDetections from "@/components/RecentDetections";
 import HeardRecently from "@/components/HeardRecently";
 
 const API = "http://127.0.0.1:8000/api";
+const POLL_INTERVAL = 15_000;       // fetch stats every 15s
+const COLLAGE_AUTO_INTERVAL = 60_000; // auto-regenerate collage every 60s
 
 export interface Stats {
   total_detections: number;
@@ -42,11 +44,30 @@ export default function Dashboard() {
   const [apiOnline, setApiOnline] = useState<boolean | null>(null);
   const [mounted, setMounted] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [lastDetectionCount, setLastDetectionCount] = useState(0);
+  const lastCollageGenRef = useRef<number>(0);
 
   useEffect(() => {
     setMounted(true);
     setCollageKey(Date.now());
   }, []);
+
+  const generateCollage = useCallback(async (auto = false) => {
+    if (generating) return;
+    setGenerating(true);
+    try {
+      await fetch(`${API}/collage/generate`, { method: "POST" });
+      setCollageKey(Date.now());
+      lastCollageGenRef.current = Date.now();
+      if (auto) {
+        console.log("Auto-regenerated collage after new detections.");
+      }
+    } catch (e) {
+      console.error("Collage generation failed:", e);
+    } finally {
+      setGenerating(false);
+    }
+  }, [generating]);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -61,7 +82,7 @@ export default function Dashboard() {
         return;
       }
 
-      const statsData = await statsRes.json();
+      const statsData: Stats = await statsRes.json();
       const detectionsData = await detectionsRes.json();
       const heardData = await heardRes.json();
 
@@ -70,24 +91,29 @@ export default function Dashboard() {
       setHeardRecently(heardData.species);
       setLastRefresh(new Date());
       setApiOnline(true);
+
+      // Auto-regenerate collage if:
+      // 1. New detections arrived since last check, AND
+      // 2. At least 60s since last generation
+      const newCount = statsData.total_detections;
+      const timeSinceLastGen = Date.now() - lastCollageGenRef.current;
+      if (
+        newCount > lastDetectionCount &&
+        lastDetectionCount > 0 &&
+        timeSinceLastGen > COLLAGE_AUTO_INTERVAL
+      ) {
+        generateCollage(true);
+      }
+      setLastDetectionCount(newCount);
+
     } catch {
       setApiOnline(false);
     }
-  }, []);
-
-  const generateCollage = async () => {
-    setGenerating(true);
-    try {
-      await fetch(`${API}/collage/generate`, { method: "POST" });
-      setCollageKey(Date.now());
-    } finally {
-      setGenerating(false);
-    }
-  };
+  }, [generateCollage, lastDetectionCount]);
 
   useEffect(() => {
     fetchAll();
-    const interval = setInterval(fetchAll, 15_000);
+    const interval = setInterval(fetchAll, POLL_INTERVAL);
     return () => clearInterval(interval);
   }, [fetchAll]);
 
@@ -104,36 +130,31 @@ export default function Dashboard() {
         </div>
 
         <div className="flex items-center gap-6">
-          {/* Navigation */}
           <nav className="flex gap-4 text-sm">
-            <Link href="/" className="text-white font-medium border-b border-stone-400 pb-0.5">
+            <Link href="/"
+              className="text-white font-medium border-b border-stone-400 pb-0.5">
               Dashboard
             </Link>
-            <Link href="/species" className="text-stone-300 hover:text-white transition-colors">
+            <Link href="/species"
+              className="text-stone-300 hover:text-white transition-colors">
               Species
             </Link>
-            <Link href="/history" className="text-stone-300 hover:text-white transition-colors">
+            <Link href="/history"
+              className="text-stone-300 hover:text-white transition-colors">
               History
             </Link>
           </nav>
 
-          {/* Status + refresh */}
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2 text-sm">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  apiOnline === null
-                    ? "bg-stone-400"
-                    : apiOnline
-                    ? "bg-green-400"
-                    : "bg-red-400"
-                }`}
-              />
+              <span className={`w-2 h-2 rounded-full ${
+                apiOnline === null ? "bg-stone-400"
+                : apiOnline ? "bg-green-400"
+                : "bg-red-400"
+              }`} />
               <span className="text-stone-300">
-                {apiOnline === null
-                  ? "Connecting…"
-                  : apiOnline
-                  ? "API online"
+                {apiOnline === null ? "Connecting…"
+                  : apiOnline ? "API online"
                   : "API offline"}
               </span>
             </div>
@@ -145,7 +166,7 @@ export default function Dashboard() {
             )}
 
             <button
-              onClick={fetchAll}
+              onClick={() => fetchAll()}
               className="bg-stone-700 hover:bg-stone-600 px-3 py-1.5 rounded text-sm transition-colors"
             >
               ↻ Refresh
@@ -162,7 +183,7 @@ export default function Dashboard() {
             <CollagePanel
               collageKey={collageKey}
               generating={generating}
-              onGenerate={generateCollage}
+              onGenerate={() => generateCollage(false)}
               apiBase={API}
             />
           </div>

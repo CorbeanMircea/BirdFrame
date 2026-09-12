@@ -22,14 +22,8 @@ export default function SpeciesPage() {
   useEffect(() => {
     fetch(`${API}/species`)
       .then((r) => r.json())
-      .then((data) => {
-        setSpecies(data);
-        setLoading(false);
-      })
-      .catch(() => {
-        setError("Could not reach the API. Is the server running?");
-        setLoading(false);
-      });
+      .then((data) => { setSpecies(data); setLoading(false); })
+      .catch(() => { setError("Could not reach the API."); setLoading(false); });
   }, []);
 
   const filtered = species.filter(
@@ -40,7 +34,6 @@ export default function SpeciesPage() {
 
   return (
     <main className="min-h-screen bg-stone-50 text-stone-800">
-      {/* Header */}
       <header className="bg-stone-800 text-stone-100 px-6 py-4 flex items-center justify-between shadow-md">
         <div className="flex items-center gap-3">
           <span className="text-2xl">🦜</span>
@@ -50,20 +43,13 @@ export default function SpeciesPage() {
           </div>
         </div>
         <nav className="flex gap-4 text-sm">
-          <Link href="/" className="text-stone-300 hover:text-white transition-colors">
-            Dashboard
-          </Link>
-          <Link href="/species" className="text-white font-medium border-b border-stone-400 pb-0.5">
-            Species
-          </Link>
-          <Link href="/history" className="text-stone-300 hover:text-white transition-colors">
-            History
-          </Link>
+          <Link href="/" className="text-stone-300 hover:text-white transition-colors">Dashboard</Link>
+          <Link href="/species" className="text-white font-medium border-b border-stone-400 pb-0.5">Species</Link>
+          <Link href="/history" className="text-stone-300 hover:text-white transition-colors">History</Link>
         </nav>
       </header>
 
       <div className="max-w-screen-xl mx-auto px-6 py-6">
-        {/* Page title + search */}
         <div className="flex items-center justify-between mb-6 gap-4 flex-wrap">
           <div>
             <h2 className="text-2xl font-bold text-stone-800">Detected Species</h2>
@@ -81,29 +67,17 @@ export default function SpeciesPage() {
           />
         </div>
 
-        {/* States */}
-        {loading && (
-          <div className="text-center py-20 text-stone-400">Loading species…</div>
-        )}
-
-        {error && (
-          <div className="text-center py-20 text-red-500">{error}</div>
-        )}
-
+        {loading && <div className="text-center py-20 text-stone-400">Loading species…</div>}
+        {error && <div className="text-center py-20 text-red-500">{error}</div>}
         {!loading && !error && filtered.length === 0 && (
           <div className="text-center py-20 text-stone-400">
-            {search
-              ? `No species match "${search}".`
-              : "No species detected yet. Start the audio pipeline to begin."}
+            {search ? `No species match "${search}".` : "No species detected yet."}
           </div>
         )}
 
-        {/* Species grid */}
         {!loading && !error && filtered.length > 0 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-            {filtered.map((s) => (
-              <SpeciesCard key={s.id} species={s} />
-            ))}
+            {filtered.map((s) => <SpeciesCard key={s.id} species={s} />)}
           </div>
         )}
       </div>
@@ -112,24 +86,19 @@ export default function SpeciesPage() {
 }
 
 function SpeciesCard({ species }: { species: Species }) {
-  const hasArtwork = species.artwork_path !== null;
-
   return (
     <div className="bg-white rounded-lg border border-stone-200 shadow-sm overflow-hidden
                     hover:shadow-md hover:border-stone-300 transition-all">
-      {/* Artwork area */}
-      <div className="bg-stone-100 h-48 flex items-center justify-center overflow-hidden">
-        {hasArtwork ? (
+      <div className="bg-stone-50 h-48 flex items-center justify-center overflow-hidden">
+        {species.artwork_path ? (
           <ArtworkImage species={species} />
         ) : (
           <div className="text-stone-300 text-center px-4">
             <div className="text-4xl mb-2">🐦</div>
-            <div className="text-xs">No illustration</div>
+            <div className="text-xs">Generating…</div>
           </div>
         )}
       </div>
-
-      {/* Info */}
       <div className="px-4 py-3">
         <h3 className="font-semibold text-stone-800 text-sm leading-tight">
           {species.common_name}
@@ -139,12 +108,11 @@ function SpeciesCard({ species }: { species: Species }) {
         </p>
         <div className="flex items-center justify-between">
           <span className="text-xs text-stone-500">
-            {species.detection_count}{" "}
-            detection{species.detection_count !== 1 ? "s" : ""}
+            {species.detection_count} detection{species.detection_count !== 1 ? "s" : ""}
           </span>
-          {hasArtwork && (
+          {species.artwork_path && (
             <span className="text-xs text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
-              ✓ Artwork
+              {species.artwork_path.startsWith("generated/") ? "✨ Generated" : "✓ Artwork"}
             </span>
           )}
         </div>
@@ -154,9 +122,11 @@ function SpeciesCard({ species }: { species: Species }) {
 }
 
 function ArtworkImage({ species }: { species: Species }) {
-  // Derive the expected artwork filename from the scientific name
-  const stem = species.scientific_name.toLowerCase().replace(/ /g, "_");
   const [failed, setFailed] = useState(false);
+
+  // artwork_path is either "generated/stem" or "stem"
+  // API endpoint is /api/species-artwork/<artwork_path>
+  const src = `${API}/species-artwork/${species.artwork_path}`;
 
   if (failed) {
     return (
@@ -167,12 +137,15 @@ function ArtworkImage({ species }: { species: Species }) {
     );
   }
 
+  // Generated PNGs have transparent backgrounds — show on white
+  const isGenerated = species.artwork_path?.startsWith("generated/");
+
   return (
     // eslint-disable-next-line @next/next/no-img-element
     <img
-      src={`http://127.0.0.1:8000/api/species-artwork/${stem}`}
+      src={src}
       alt={species.common_name}
-      className="w-full h-full object-contain p-2"
+      className={`h-full object-contain ${isGenerated ? "p-4" : "w-full p-2"}`}
       onError={() => setFailed(true)}
     />
   );
