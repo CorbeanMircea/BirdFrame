@@ -92,7 +92,7 @@
       ],
       "outputs": [{"name": "LATENT", "type": "LATENT", "links": [7]}],
       "properties": {},
-      "widgets_values": [42, "fixed", 20, 1.0, "euler", "simple", 1.0]
+      "widgets_values": [42, "fixed", 30, 1.0, "euler", "simple", 1.0]
     },
     {
       "id": 6,
